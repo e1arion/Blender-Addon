@@ -1,30 +1,30 @@
 """
-Roblox LC Tools — License Server
-==================================
-Deploy this to Railway (or any Python host).
+Roblox LC Tools — License Server  v2.0.0
+==========================================
+Deploy to Railway. See README below.
 
-Quick-start
------------
-  1.  railway login && railway init
-  2.  railway add --plugin postgresql   ← optional, SQLite works fine too
-  3.  Set environment variables in Railway dashboard:
-        ADMIN_TOKEN=<long random secret>   # protects /admin/* routes
-        PORT=8000                          # Railway sets this automatically
-  4.  Push this file (+ requirements.txt) to your linked GitHub repo.
-  5.  Railway auto-deploys on every push.
+SETUP (one-time)
+-----------------
+1. Create GitHub repo, push this file + requirements.txt + Procfile
+2. Connect repo to Railway → new service
+3. Set environment variables in Railway dashboard:
+     ADMIN_TOKEN = any long secret string you choose
+     PORT        = (Railway sets this automatically — do not touch)
+4. After first deploy, your URL is shown in Railway dashboard.
+   Paste it into roblox_lc_tools.py as SERVER_URL.
 
-requirements.txt contents (create this file alongside server.py):
+requirements.txt:
   fastapi==0.111.0
   uvicorn==0.29.0
-  python-dotenv==1.0.1
 
-Procfile contents (Railway needs this):
+Procfile:
   web: uvicorn license_server:app --host 0.0.0.0 --port $PORT
 """
 
-import os, sqlite3, hashlib, datetime, secrets, contextlib
-from fastapi import FastAPI, HTTPException, Header, Depends
+import os, sqlite3, hashlib, datetime, secrets
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -304,34 +304,34 @@ SEEDED_KEY_HASHES = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def _init_db():
-    with _db() as conn:
-        conn.execute("""
+    with _db() as c:
+        c.execute("""
             CREATE TABLE IF NOT EXISTS licenses (
                 key_hash      TEXT PRIMARY KEY,
-                status        TEXT    NOT NULL DEFAULT 'unused',
+                status        TEXT NOT NULL DEFAULT 'unused',
                 machine_id    TEXT,
+                machine_name  TEXT,
                 discord_user  TEXT,
                 note          TEXT,
-                created_at    TEXT    NOT NULL,
+                created_at    TEXT NOT NULL,
                 activated_at  TEXT,
                 expires_at    TEXT
             )
         """)
-        # Seed all pre-generated keys (INSERT OR IGNORE = safe to run repeatedly)
         now = datetime.datetime.utcnow().isoformat()
         for h in SEEDED_KEY_HASHES:
-            conn.execute(
-                "INSERT OR IGNORE INTO licenses "
-                "(key_hash, status, created_at) VALUES (?, 'unused', ?)",
+            c.execute(
+                "INSERT OR IGNORE INTO licenses (key_hash,status,created_at) "
+                "VALUES (?,  'unused', ?)",
                 (h, now)
             )
-        conn.commit()
+        c.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,21 +341,24 @@ def _init_db():
 def _hash(key: str) -> str:
     return hashlib.sha256(key.strip().upper().encode()).hexdigest()
 
-
-def _now_iso() -> str:
+def _now() -> str:
     return datetime.datetime.utcnow().isoformat()
-
 
 def _require_admin(x_admin_token: str = Header(...)):
     if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token.")
+        raise HTTPException(403, "Invalid admin token.")
+
+def _get_row(conn, h: str):
+    return conn.execute(
+        "SELECT * FROM licenses WHERE key_hash=?", (h,)
+    ).fetchone()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  APP
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Roblox LC Tools License API", version="1.0.0")
+app = FastAPI(title="RLC License API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -366,167 +369,129 @@ def startup():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC ENDPOINTS  (called by the Blender addon)
+#  PUBLIC — called by the Blender addon
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ActivateRequest(BaseModel):
-    license_key: str
-    machine_id:  str
+class ActivateReq(BaseModel):
+    license_key:  str
+    machine_id:   str
+    machine_name: Optional[str] = ""
 
-class ValidateRequest(BaseModel):
+class ValidateReq(BaseModel):
     license_key: str
     machine_id:  str
 
 
 @app.post("/activate")
-def activate(req: ActivateRequest):
-    """
-    First-time activation for a license key on a specific machine.
-    - Key must exist and be 'unused' OR already registered to this same machine.
-    - Sets status to 'registered', stores machine_id, sets expires_at (+1 year).
-    """
+def activate(req: ActivateReq):
     h = _hash(req.license_key)
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM licenses WHERE key_hash = ?", (h,)
-        ).fetchone()
+    with _db() as c:
+        row = _get_row(c, h)
 
         if row is None:
-            raise HTTPException(404, detail="Invalid license key.")
+            raise HTTPException(404, "License key not found.")
+
+        if row["status"] == "disabled":
+            raise HTTPException(403, "This license has been deactivated. "
+                                      "Contact support.")
 
         if row["status"] == "expired":
-            raise HTTPException(403, detail="This license has expired.")
+            raise HTTPException(403, "This license has expired. "
+                                      "Contact support to renew.")
 
         if row["status"] == "registered":
-            # Already activated — only allow if same machine
             if row["machine_id"] != req.machine_id:
-                raise HTTPException(403, detail=(
-                    "This key is already registered to a different device. "
-                    "Contact support to transfer your license."
-                ))
-            # Same machine re-activating — just return current expiry
-            return {
-                "status":     "already_active",
-                "expires_at": row["expires_at"],
-                "message":    "License already active on this device.",
-            }
+                # Already locked to a different device — hard block
+                raise HTTPException(403,
+                    "This key is already registered to another device. "
+                    "Contact support to transfer your license.")
+            # Same machine re-activating (e.g. reinstall)
+            return {"status": "already_active",
+                    "expires_at": row["expires_at"],
+                    "message": "License already active on this device."}
 
         # Fresh activation
         now        = datetime.datetime.utcnow()
         expires_at = (now + datetime.timedelta(days=365)).isoformat()
-
-        conn.execute("""
+        c.execute("""
             UPDATE licenses
-            SET status='registered', machine_id=?, activated_at=?, expires_at=?
+            SET status='registered', machine_id=?, machine_name=?,
+                activated_at=?, expires_at=?
             WHERE key_hash=?
-        """, (req.machine_id, now.isoformat(), expires_at, h))
-        conn.commit()
+        """, (req.machine_id, req.machine_name or "",
+              now.isoformat(), expires_at, h))
+        c.commit()
 
-        return {
-            "status":     "activated",
-            "expires_at": expires_at,
-            "message":    "License activated successfully.",
-        }
+    return {"status": "activated", "expires_at": expires_at,
+            "message": "License activated."}
 
 
 @app.post("/validate")
-def validate(req: ValidateRequest):
-    """
-    Called by the addon on every Blender startup.
-    Returns valid=True/False plus the reason if invalid.
-    """
+def validate(req: ValidateReq):
     h = _hash(req.license_key)
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM licenses WHERE key_hash = ?", (h,)
-        ).fetchone()
+    with _db() as c:
+        row = _get_row(c, h)
 
     if row is None:
         return {"valid": False, "reason": "invalid_key"}
 
-    if row["status"] == "unused":
+    if row["status"] == "disabled":
+        return {"valid": False, "reason": "license_disabled"}
+
+    if row["status"] in ("unused", "not_activated"):
         return {"valid": False, "reason": "not_activated"}
 
     if row["machine_id"] != req.machine_id:
         return {"valid": False, "reason": "wrong_machine"}
 
-    # Check server-side expiry (double-check — client also checks locally)
     try:
         expires = datetime.datetime.fromisoformat(row["expires_at"])
         if datetime.datetime.utcnow() > expires:
-            # Auto-mark as expired
-            with _db() as conn:
-                conn.execute(
-                    "UPDATE licenses SET status='expired' WHERE key_hash=?", (h,)
-                )
+            with _db() as c:
+                c.execute("UPDATE licenses SET status='expired' "
+                          "WHERE key_hash=?", (h,))
             return {"valid": False, "reason": "expired"}
     except Exception:
         return {"valid": False, "reason": "corrupt_record"}
 
-    return {
-        "valid":      True,
-        "reason":     "ok",
-        "expires_at": row["expires_at"],
-    }
+    return {"valid": True, "reason": "ok", "expires_at": row["expires_at"]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ADMIN ENDPOINTS  (protected — call from your Discord bot or dashboard)
+#  ADMIN — protected, called from the dashboard
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GenerateRequest(BaseModel):
+class GenerateReq(BaseModel):
     discord_user: Optional[str] = None
     note:         Optional[str] = None
     count:        int           = 1
 
+class AssignDiscordReq(BaseModel):
+    key_hash:     str
+    discord_user: str
 
-@app.post("/admin/generate", dependencies=[Depends(_require_admin)])
-def admin_generate(req: GenerateRequest):
-    """
-    Generate brand-new license keys and add them to the database.
-    Use this from your Discord bot: POST /admin/generate with count=1.
-    """
-    now  = _now_iso()
-    keys = []
-    with _db() as conn:
-        for _ in range(max(1, min(req.count, 50))):  # cap at 50 per call
-            raw_key = "RBLX-" + "-".join(
-                secrets.token_hex(2).upper() for _ in range(4)
-            )
-            h = _hash(raw_key)
-            conn.execute("""
-                INSERT OR IGNORE INTO licenses
-                (key_hash, status, discord_user, note, created_at)
-                VALUES (?, 'unused', ?, ?, ?)
-            """, (h, req.discord_user, req.note, now))
-            keys.append(raw_key)
-        conn.commit()
-    return {"generated": len(keys), "keys": keys}
+class SetStatusReq(BaseModel):
+    key_hash: str
+    status:   str   # "registered" (enable) or "disabled"
+
+class RenewReq(BaseModel):
+    key_hash: str
+    days:     int = 365
+
+class ResetMachineReq(BaseModel):
+    key_hash: str
 
 
-@app.post("/admin/revoke/{key_hash_prefix}", dependencies=[Depends(_require_admin)])
-def admin_revoke(key_hash_prefix: str):
-    """Force-expire a license by its key hash prefix (first 8 chars is enough)."""
-    with _db() as conn:
-        result = conn.execute("""
-            UPDATE licenses SET status='expired'
-            WHERE key_hash LIKE ? AND status != 'expired'
-        """, (key_hash_prefix + "%",))
-        conn.commit()
-        return {"revoked": result.rowcount}
-
-
-@app.get("/admin/list", dependencies=[Depends(_require_admin)])
+@app.get("/admin/licenses", dependencies=[Depends(_require_admin)])
 def admin_list(status: Optional[str] = None):
-    """List all licenses, optionally filtered by status (unused/registered/expired)."""
-    with _db() as conn:
+    with _db() as c:
         if status:
-            rows = conn.execute(
+            rows = c.execute(
                 "SELECT * FROM licenses WHERE status=? ORDER BY created_at DESC",
                 (status,)
             ).fetchall()
         else:
-            rows = conn.execute(
+            rows = c.execute(
                 "SELECT * FROM licenses ORDER BY created_at DESC"
             ).fetchall()
     return {"count": len(rows), "licenses": [dict(r) for r in rows]}
@@ -534,12 +499,112 @@ def admin_list(status: Optional[str] = None):
 
 @app.get("/admin/stats", dependencies=[Depends(_require_admin)])
 def admin_stats():
-    """Quick summary of license counts by status."""
-    with _db() as conn:
-        rows = conn.execute("""
-            SELECT status, COUNT(*) as count FROM licenses GROUP BY status
-        """).fetchall()
-    return {r["status"]: r["count"] for r in rows}
+    with _db() as c:
+        rows = c.execute(
+            "SELECT status, COUNT(*) as n FROM licenses GROUP BY status"
+        ).fetchall()
+    totals = {r["status"]: r["n"] for r in rows}
+    totals["total"] = sum(totals.values())
+    return totals
+
+
+@app.post("/admin/generate", dependencies=[Depends(_require_admin)])
+def admin_generate(req: GenerateReq):
+    now  = _now()
+    keys = []
+    with _db() as c:
+        for _ in range(max(1, min(req.count, 100))):
+            raw = "RBLX-" + "-".join(
+                secrets.token_hex(2).upper() for _ in range(4)
+            )
+            h = _hash(raw)
+            c.execute("""
+                INSERT OR IGNORE INTO licenses
+                (key_hash, status, discord_user, note, created_at)
+                VALUES (?, 'unused', ?, ?, ?)
+            """, (h, req.discord_user, req.note, now))
+            keys.append(raw)
+        c.commit()
+    return {"generated": len(keys), "keys": keys}
+
+
+@app.post("/admin/assign_discord", dependencies=[Depends(_require_admin)])
+def admin_assign_discord(req: AssignDiscordReq):
+    with _db() as c:
+        n = c.execute(
+            "UPDATE licenses SET discord_user=? WHERE key_hash=?",
+            (req.discord_user, req.key_hash)
+        ).rowcount
+        c.commit()
+    if n == 0:
+        raise HTTPException(404, "Key not found.")
+    return {"updated": True}
+
+
+@app.post("/admin/set_status", dependencies=[Depends(_require_admin)])
+def admin_set_status(req: SetStatusReq):
+    allowed = {"registered", "disabled", "unused"}
+    if req.status not in allowed:
+        raise HTTPException(422, f"status must be one of {allowed}")
+    with _db() as c:
+        n = c.execute(
+            "UPDATE licenses SET status=? WHERE key_hash=?",
+            (req.status, req.key_hash)
+        ).rowcount
+        c.commit()
+    if n == 0:
+        raise HTTPException(404, "Key not found.")
+    return {"updated": True, "new_status": req.status}
+
+
+@app.post("/admin/renew", dependencies=[Depends(_require_admin)])
+def admin_renew(req: RenewReq):
+    new_expiry = (
+        datetime.datetime.utcnow() + datetime.timedelta(days=req.days)
+    ).isoformat()
+    with _db() as c:
+        # If disabled/expired, set back to registered
+        row = c.execute(
+            "SELECT * FROM licenses WHERE key_hash=?", (req.key_hash,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Key not found.")
+        new_status = "registered" if row["machine_id"] else row["status"]
+        n = c.execute(
+            "UPDATE licenses SET expires_at=?, status=? WHERE key_hash=?",
+            (new_expiry, new_status, req.key_hash)
+        ).rowcount
+        c.commit()
+    if n == 0:
+        raise HTTPException(404, "Key not found.")
+    return {"renewed": True, "expires_at": new_expiry}
+
+
+@app.post("/admin/reset_machine", dependencies=[Depends(_require_admin)])
+def admin_reset_machine(req: ResetMachineReq):
+    """Clear machine lock so the key can be activated on a new device."""
+    with _db() as c:
+        n = c.execute(
+            "UPDATE licenses SET machine_id=NULL, machine_name=NULL, "
+            "status='unused', activated_at=NULL WHERE key_hash=?",
+            (req.key_hash,)
+        ).rowcount
+        c.commit()
+    if n == 0:
+        raise HTTPException(404, "Key not found.")
+    return {"reset": True}
+
+
+@app.delete("/admin/delete/{key_hash}", dependencies=[Depends(_require_admin)])
+def admin_delete(key_hash: str):
+    with _db() as c:
+        n = c.execute(
+            "DELETE FROM licenses WHERE key_hash=?", (key_hash,)
+        ).rowcount
+        c.commit()
+    if n == 0:
+        raise HTTPException(404, "Key not found.")
+    return {"deleted": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,12 +613,8 @@ def admin_stats():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0"}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  LOCAL DEV
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
