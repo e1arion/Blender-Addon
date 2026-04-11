@@ -263,8 +263,12 @@ SEEDED_KEY_HASHES = [
 ]
 
 import os, sqlite3, hashlib, datetime, secrets, time
-import numpy as np
-from scipy.spatial import KDTree
+try:
+    import numpy as np
+    from scipy.spatial import KDTree
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -391,6 +395,8 @@ def _moller(orig, direction, v0, v1, v2):
     return True, t, hit, normal
 
 def algo_transfer_weights(src_verts, src_faces, src_weights_in, tgt_verts):
+    if not _HAS_NUMPY:
+        raise RuntimeError('numpy/scipy not available on this server. Check requirements.txt.')
     SV   = np.array(src_verts, dtype=np.float64)
     SF   = np.array(src_faces,  dtype=np.int32)
     TV   = np.array(tgt_verts,  dtype=np.float64)
@@ -419,6 +425,8 @@ def algo_transfer_weights(src_verts, src_faces, src_weights_in, tgt_verts):
     return out
 
 def algo_smooth_weights(verts, edges, weights_in, iterations, factor, expand):
+    if not _HAS_NUMPY:
+        raise RuntimeError('numpy/scipy not available on this server. Check requirements.txt.')
     N   = len(verts)
     adj = [[] for _ in range(N)]
     for e in edges:
@@ -444,6 +452,8 @@ def algo_smooth_weights(verts, edges, weights_in, iterations, factor, expand):
     return out
 
 def algo_fit_cage(cage_verts, cage_faces, target_verts, target_faces, offset, subdiv_levels):
+    if not _HAS_NUMPY:
+        raise RuntimeError('numpy/scipy not available on this server. Check requirements.txt.')
     CV = np.array(cage_verts,   dtype=np.float64)
     TV = np.array(target_verts, dtype=np.float64)
     TF = np.array(target_faces, dtype=np.int32)
