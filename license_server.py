@@ -1,40 +1,3 @@
-"""
-Roblox LC Tools — License Server  v2.0.0
-==========================================
-Deploy to Railway. See README below.
-
-SETUP (one-time)
------------------
-1. Create GitHub repo, push this file + requirements.txt + Procfile
-2. Connect repo to Railway → new service
-3. Set environment variables in Railway dashboard:
-     ADMIN_TOKEN = any long secret string you choose
-     PORT        = (Railway sets this automatically — do not touch)
-4. After first deploy, your URL is shown in Railway dashboard.
-   Paste it into roblox_lc_tools.py as SERVER_URL.
-
-requirements.txt:
-  fastapi==0.111.0
-  uvicorn==0.29.0
-
-Procfile:
-  web: uvicorn license_server:app --host 0.0.0.0 --port $PORT
-"""
-
-import os, sqlite3, hashlib, datetime, secrets
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Optional
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-me-before-deploying")
-DB_PATH     = os.environ.get("DB_PATH", "licenses.db")
-
 # Pre-seeded key hashes — SHA-256 of each raw license key
 SEEDED_KEY_HASHES = [
     "d7aa4c04621867b12130b3939666d1d43f91e40b50d9d947d9ceabbe9e846590",
@@ -300,372 +263,453 @@ SEEDED_KEY_HASHES = [
 ]
 
 import os, sqlite3, hashlib, datetime, secrets, time
+import numpy as np
+from scipy.spatial import KDTree
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-me-before-deploying")
 DB_PATH     = os.environ.get("DB_PATH", "licenses.db")
+SESSION_TTL = 7200
+PERMIT_TTL  = 60
 
-# Session TTL in seconds — client re-validates when session expires
-SESSION_TTL = 7200   # 2 hours
+_sessions: Dict[str, dict] = {}
+_permits:  Dict[str, dict] = {}
 
-# Permit TTL in seconds — how long an operation permit stays valid
-PERMIT_TTL  = 60     # 60 seconds (one-time use enforced by server)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  IN-MEMORY STORES  (lost on server restart — clients simply re-validate)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# session_id → {machine_id, key_hash, expires_at (epoch float)}
-_sessions: dict = {}
-
-# permit_id → {session_id, operation, expires_at (epoch float), used (bool)}
-_permits:  dict = {}
-
-
-def _prune():
-    """Remove expired sessions and permits (called lazily on each request)."""
-    now = time.time()
-    expired_sessions = [k for k, v in _sessions.items() if v["expires"] < now]
-    for k in expired_sessions: del _sessions[k]
-    expired_permits  = [k for k, v in _permits.items()
-                        if v["expires"] < now or v["used"]]
-    for k in expired_permits:  del _permits[k]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
+ROBLOX_HIERARCHY = {
+    "Root":             ["HumanoidRootNode"],
+    "HumanoidRootNode": ["LowerTorso"],
+    "LowerTorso":       ["LeftUpperLeg", "RightUpperLeg", "UpperTorso"],
+    "LeftUpperLeg":     ["LeftLowerLeg"],   "LeftLowerLeg":  ["LeftFoot"],
+    "LeftFoot":         [],
+    "RightUpperLeg":    ["RightLowerLeg"],  "RightLowerLeg": ["RightFoot"],
+    "RightFoot":        [],
+    "UpperTorso":       ["Head", "LeftUpperArm", "RightUpperArm"],
+    "Head":             [],
+    "LeftUpperArm":     ["LeftLowerArm"],   "LeftLowerArm":  ["LeftHand"],
+    "LeftHand":         [],
+    "RightUpperArm":    ["RightLowerArm"],  "RightLowerArm": ["RightHand"],
+    "RightHand":        [],
+}
+REQUIRED_BONES = set(ROBLOX_HIERARCHY.keys())
 
 def _db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 def _init_db():
     with _db() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS licenses (
-                key_hash      TEXT PRIMARY KEY,
-                status        TEXT NOT NULL DEFAULT 'unused',
-                machine_id    TEXT,
-                machine_name  TEXT,
-                discord_user  TEXT,
-                note          TEXT,
-                created_at    TEXT NOT NULL,
-                activated_at  TEXT,
-                expires_at    TEXT
-            )
-        """)
+        c.execute("""CREATE TABLE IF NOT EXISTS licenses (
+            key_hash TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'unused',
+            machine_id TEXT, machine_name TEXT, discord_user TEXT, note TEXT,
+            created_at TEXT NOT NULL, activated_at TEXT, expires_at TEXT)""")
         now = datetime.datetime.utcnow().isoformat()
         for h in SEEDED_KEY_HASHES:
-            c.execute(
-                "INSERT OR IGNORE INTO licenses (key_hash,status,created_at) "
-                "VALUES (?, 'unused', ?)", (h, now)
-            )
+            c.execute("INSERT OR IGNORE INTO licenses (key_hash,status,created_at) VALUES(?,?,?)",
+                      (h, "unused", now))
         c.commit()
 
-def _hash(key: str) -> str:
-    return hashlib.sha256(key.strip().upper().encode()).hexdigest()
+def _hash(k):
+    return hashlib.sha256(k.strip().upper().encode()).hexdigest()
 
-def _now_iso() -> str:
+def _now():
     return datetime.datetime.utcnow().isoformat()
 
-def _require_admin(x_admin_token: str = Header(...)):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(403, "Invalid admin token.")
+def _row(c, h):
+    return c.execute("SELECT * FROM licenses WHERE key_hash=?", (h,)).fetchone()
 
-def _get_row(conn, h: str):
-    return conn.execute("SELECT * FROM licenses WHERE key_hash=?", (h,)).fetchone()
-
-def _row_is_valid(row) -> tuple:
-    """Returns (valid: bool, reason: str). Checks status and expiry."""
-    if row is None:
-        return False, "invalid_key"
-    if row["status"] == "disabled":
-        return False, "license_disabled"
-    if row["status"] in ("unused",):
-        return False, "not_activated"
-    if row["machine_id"] is None:
-        return False, "not_activated"
-    # Check expiry
+def _valid_row(row):
+    if row is None:                     return False, "invalid_key"
+    if row["status"] == "disabled":     return False, "license_disabled"
+    if row["status"] == "unused":       return False, "not_activated"
+    if not row["machine_id"]:           return False, "not_activated"
     try:
-        expires = datetime.datetime.fromisoformat(row["expires_at"])
-        if datetime.datetime.utcnow() > expires:
+        if datetime.datetime.utcnow() > datetime.datetime.fromisoformat(row["expires_at"]):
             return False, "expired"
     except Exception:
         return False, "corrupt_record"
     return True, "ok"
 
+def _prune():
+    now = time.time()
+    for k in [k for k, v in _sessions.items() if v["expires"] < now]: del _sessions[k]
+    for k in [k for k, v in _permits.items()  if v["expires"] < now or v["used"]]:  del _permits[k]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  APP
-# ─────────────────────────────────────────────────────────────────────────────
+def _require_admin(x_admin_token: str = Header(...)):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(403, "Invalid admin token.")
 
-app = FastAPI(title="RLC License API", version="2.5.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+def _verify_session(session_id, machine_id):
+    _prune()
+    sess = _sessions.get(session_id)
+    if not sess or time.time() > sess["expires"]:
+        raise HTTPException(403, "Session not found or expired. Restart Blender to re-authenticate.")
+    if sess["machine_id"] != machine_id:
+        raise HTTPException(403, "Machine ID mismatch.")
+    with _db() as c:
+        row = _row(c, sess["key_hash"])
+        valid, reason = _valid_row(row)
+        if not valid:
+            del _sessions[session_id]
+            raise HTTPException(403, reason)
+        if row["machine_id"] != machine_id:
+            del _sessions[session_id]
+            raise HTTPException(403, "wrong_machine")
+    return row
+
+def _bary(p, a, b, c):
+    v0 = b - a; v1 = c - a; v2 = p - a
+    d00 = np.dot(v0, v0); d01 = np.dot(v0, v1); d11 = np.dot(v1, v1)
+    d20 = np.dot(v2, v0); d21 = np.dot(v2, v1)
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) < 1e-12: return 1/3, 1/3, 1/3
+    v  = (d11 * d20 - d01 * d21) / denom
+    w  = (d00 * d21 - d01 * d20) / denom
+    return 1.0 - v - w, v, w
+
+def _moller(orig, direction, v0, v1, v2):
+    e1 = v1 - v0; e2 = v2 - v0
+    h  = np.cross(direction, e2)
+    det = np.dot(e1, h)
+    if abs(det) < 1e-8: return False, 0.0, None, None
+    inv = 1.0 / det
+    s   = orig - v0
+    u   = inv * np.dot(s, h)
+    if u < 0.0 or u > 1.0: return False, 0.0, None, None
+    q   = np.cross(s, e1)
+    v_  = inv * np.dot(direction, q)
+    if v_ < 0.0 or u + v_ > 1.0: return False, 0.0, None, None
+    t   = inv * np.dot(e2, q)
+    if t < 1e-6: return False, 0.0, None, None
+    hit    = orig + direction * t
+    normal = np.cross(e1, e2)
+    nl     = np.linalg.norm(normal)
+    if nl > 0: normal /= nl
+    return True, t, hit, normal
+
+def algo_transfer_weights(src_verts, src_faces, src_weights_in, tgt_verts):
+    SV   = np.array(src_verts, dtype=np.float64)
+    SF   = np.array(src_faces,  dtype=np.int32)
+    TV   = np.array(tgt_verts,  dtype=np.float64)
+    centroids = SV[SF].mean(axis=1)
+    tree = KDTree(centroids)
+    out  = {}
+    for gname, assignments in src_weights_in.items():
+        sw = np.zeros(len(SV), dtype=np.float64)
+        for vi_str, w in assignments.items():
+            idx = int(vi_str)
+            if 0 <= idx < len(SV): sw[idx] = float(w)
+        tgt_w = {}
+        for ti, tv in enumerate(TV):
+            _, fi = tree.query(tv, k=1)
+            fi    = int(fi)
+            a, b, c = SV[SF[fi]]
+            u, v, w_ = _bary(tv, a, b, c)
+            u  = max(0.0, min(1.0, u))
+            v  = max(0.0, min(1.0, v))
+            w_ = max(0.0, min(1.0, w_))
+            s  = u + v + w_
+            if s > 0: u, v, w_ = u/s, v/s, w_/s
+            interp = u * sw[SF[fi][0]] + v * sw[SF[fi][1]] + w_ * sw[SF[fi][2]]
+            if interp > 0.0001: tgt_w[str(ti)] = round(float(interp), 6)
+        if tgt_w: out[gname] = tgt_w
+    return out
+
+def algo_smooth_weights(verts, edges, weights_in, iterations, factor, expand):
+    N   = len(verts)
+    adj = [[] for _ in range(N)]
+    for e in edges:
+        a, b = int(e[0]), int(e[1])
+        adj[a].append(b); adj[b].append(a)
+    out = {}
+    for gname, assignments in weights_in.items():
+        w = np.zeros(N, dtype=np.float64)
+        for vi_str, wv in assignments.items():
+            idx = int(vi_str)
+            if 0 <= idx < N: w[idx] = float(wv)
+        for _ in range(max(1, int(iterations))):
+            nw = w.copy()
+            for i in range(N):
+                nb = adj[i]
+                if not nb: continue
+                avg    = np.mean(w[nb])
+                nw[i]  = w[i] * (1 - factor) + avg * factor
+                if expand > 0: nw[i] = max(nw[i], w[i] * expand)
+            w = np.clip(nw, 0.0, 1.0)
+        tgt = {str(i): round(float(w[i]), 6) for i in range(N) if w[i] > 0.0001}
+        if tgt: out[gname] = tgt
+    return out
+
+def algo_fit_cage(cage_verts, cage_faces, target_verts, target_faces, offset, subdiv_levels):
+    CV = np.array(cage_verts,   dtype=np.float64)
+    TV = np.array(target_verts, dtype=np.float64)
+    TF = np.array(target_faces, dtype=np.int32)
+    for _ in range(min(int(subdiv_levels), 3)):
+        nv       = list(TV)
+        nf       = []
+        edge_mid = {}
+        def mp(a, b):
+            key = (min(a, b), max(a, b))
+            if key not in edge_mid:
+                edge_mid[key] = len(nv)
+                nv.append((TV[a] + TV[b]) / 2)
+            return edge_mid[key]
+        for f in TF:
+            m01 = mp(f[0], f[1]); m12 = mp(f[1], f[2]); m20 = mp(f[2], f[0])
+            nf += [[f[0],m01,m20],[m01,f[1],m12],[m20,m12,f[2]],[m01,m12,m20]]
+        TV = np.array(nv, dtype=np.float64)
+        TF = np.array(nf, dtype=np.int32)
+    v0s = TV[TF[:,0]]; v1s = TV[TF[:,1]]; v2s = TV[TF[:,2]]
+    axes = [np.array([1,0,0],dtype=np.float64),
+            np.array([0,1,0],dtype=np.float64),
+            np.array([0,0,1],dtype=np.float64)]
+    out = []
+    for vert in CV:
+        best_t = np.inf; best_pt = None; best_n = None
+        for axis in axes:
+            for fi in range(len(TF)):
+                hit, t, pt, n = _moller(vert, axis, v0s[fi], v1s[fi], v2s[fi])
+                if hit and t < best_t: best_t = t; best_pt = pt; best_n = n
+        if best_pt is not None and best_n is not None:
+            np_ = best_pt + best_n * float(offset)
+            out.append([round(float(x), 6) for x in np_])
+        else:
+            out.append([round(float(x), 6) for x in vert])
+    return out
+
+def algo_validate_rig(bones_dict, autofix):
+    lower_map = {n.lower(): n for n in REQUIRED_BONES}
+    renames   = {}
+    issues    = []
+    bnames    = set(bones_dict.keys())
+    if autofix:
+        for bn in list(bnames):
+            correct = lower_map.get(bn.lower())
+            if correct and bn != correct:
+                renames[bn] = correct
+        for old, new in renames.items():
+            bnames.discard(old); bnames.add(new)
+        nb = {}
+        for bn, parent in bones_dict.items():
+            nn = renames.get(bn, bn)
+            np_ = renames.get(parent, parent) if parent else parent
+            nb[nn] = np_
+        bones_dict = nb
+    if renames:
+        issues.append({"severity": "WARNING",
+                       "message":  f"Auto-fixed {len(renames)} name(s): "
+                                   + ", ".join(f"{o}→{n}" for o, n in renames.items())})
+    for b in sorted(REQUIRED_BONES - bnames):
+        issues.append({"severity": "ERROR", "message": f"Missing bone: '{b}'"})
+    for bname, children in ROBLOX_HIERARCHY.items():
+        for child in children:
+            if child not in bnames: continue
+            actual = bones_dict.get(child)
+            if actual != bname:
+                issues.append({"severity": "ERROR",
+                                "message":  f"'{child}' parent should be '{bname}', got '{actual}'"})
+    return issues, renames
+
+app = FastAPI(title="RLC License API", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
 def startup(): _init_db()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC: /activate
-#  First-time registration of a license key to a machine.
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ActivateReq(BaseModel):
-    license_key:  str
-    machine_id:   str
-    machine_name: Optional[str] = ""
-
-@app.post("/activate")
-def activate(req: ActivateReq):
-    _prune()
-    h = _hash(req.license_key)
-    with _db() as c:
-        row = _get_row(c, h)
-
-        if row is None:
-            raise HTTPException(404, "License key not found.")
-        if row["status"] == "disabled":
-            raise HTTPException(403, "This license has been deactivated. "
-                                      "Contact support.")
-        if row["status"] == "expired":
-            raise HTTPException(403, "This license has expired. "
-                                      "Contact support to renew.")
-        if row["status"] == "registered":
-            if row["machine_id"] != req.machine_id:
-                raise HTTPException(403,
-                    "This key is already registered to another device. "
-                    "Contact support to transfer your license.")
-            # Same machine re-activating — issue a fresh session
-            valid, reason = _row_is_valid(row)
-            if not valid:
-                raise HTTPException(403, reason)
-            session_id = secrets.token_urlsafe(32)
-            _sessions[session_id] = {
-                "machine_id": req.machine_id,
-                "key_hash":   h,
-                "expires":    time.time() + SESSION_TTL,
-            }
-            return {"status": "already_active", "expires_at": row["expires_at"],
-                    "session_id": session_id, "session_expires_in": SESSION_TTL}
-
-        # Fresh activation
-        now        = datetime.datetime.utcnow()
-        expires_at = (now + datetime.timedelta(days=365)).isoformat()
-        c.execute("""
-            UPDATE licenses
-            SET status='registered', machine_id=?, machine_name=?,
-                activated_at=?, expires_at=?
-            WHERE key_hash=?
-        """, (req.machine_id, req.machine_name or "",
-              now.isoformat(), expires_at, h))
-        c.commit()
-
-    session_id = secrets.token_urlsafe(32)
-    _sessions[session_id] = {
-        "machine_id": req.machine_id,
-        "key_hash":   h,
-        "expires":    time.time() + SESSION_TTL,
-    }
-    return {"status": "activated", "expires_at": expires_at,
-            "session_id": session_id, "session_expires_in": SESSION_TTL}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC: /session
-#  Called every Blender launch to get a fresh session token.
-#  This is the replacement for /validate — it returns a session_id.
-# ─────────────────────────────────────────────────────────────────────────────
+    license_key: str; machine_id: str; machine_name: Optional[str] = ""
 
 class SessionReq(BaseModel):
-    license_key:  str
-    machine_id:   str
-    machine_name: Optional[str] = ""
-
-@app.post("/session")
-def create_session(req: SessionReq):
-    _prune()
-    h = _hash(req.license_key)
-    with _db() as c:
-        row = _get_row(c, h)
-        valid, reason = _row_is_valid(row)
-
-        if not valid:
-            # Update machine_name if it changed (e.g. computer renamed)
-            return {"valid": False, "reason": reason}
-
-        if row["machine_id"] != req.machine_id:
-            return {"valid": False, "reason": "wrong_machine"}
-
-        # Update machine_name in case it changed
-        c.execute("UPDATE licenses SET machine_name=? WHERE key_hash=?",
-                  (req.machine_name or row["machine_name"], h))
-        c.commit()
-
-    session_id = secrets.token_urlsafe(32)
-    _sessions[session_id] = {
-        "machine_id": req.machine_id,
-        "key_hash":   h,
-        "expires":    time.time() + SESSION_TTL,
-    }
-    return {
-        "valid":              True,
-        "reason":             "ok",
-        "session_id":         session_id,
-        "session_expires_in": SESSION_TTL,
-        "license_expires_at": row["expires_at"],
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC: /permit
-#  Called before every protected operation in the addon.
-#  Verifies session is genuine, license still active, machine matches.
-#  Returns a single-use permit_id (60s TTL) or 403.
-# ─────────────────────────────────────────────────────────────────────────────
+    license_key: str; machine_id: str; machine_name: Optional[str] = ""
 
 class PermitReq(BaseModel):
-    session_id: str
-    machine_id: str
-    operation:  str
-
-@app.post("/permit")
-def issue_permit(req: PermitReq):
-    _prune()
-
-    # 1. Look up the session
-    sess = _sessions.get(req.session_id)
-    if sess is None:
-        raise HTTPException(403, "Session not found or expired. "
-                                  "Restart Blender to re-authenticate.")
-
-    # 2. Check session not expired
-    if time.time() > sess["expires"]:
-        del _sessions[req.session_id]
-        raise HTTPException(403, "Session expired. Restart Blender.")
-
-    # 3. Verify machine_id matches session
-    if sess["machine_id"] != req.machine_id:
-        raise HTTPException(403, "Machine ID mismatch.")
-
-    # 4. Re-check license is still active (catches real-time dashboard changes)
-    with _db() as c:
-        row = _get_row(c, sess["key_hash"])
-        valid, reason = _row_is_valid(row)
-        if not valid:
-            # Invalidate session immediately
-            del _sessions[req.session_id]
-            raise HTTPException(403, reason)
-        if row["machine_id"] != req.machine_id:
-            del _sessions[req.session_id]
-            raise HTTPException(403, "wrong_machine")
-
-    # 5. Issue single-use permit
-    permit_id = secrets.token_urlsafe(24)
-    _permits[permit_id] = {
-        "session_id": req.session_id,
-        "operation":  req.operation,
-        "expires":    time.time() + PERMIT_TTL,
-        "used":       False,
-    }
-    return {"allowed": True, "permit_id": permit_id}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC: /validate  (kept for backward compat — now wraps /session logic)
-# ─────────────────────────────────────────────────────────────────────────────
+    session_id: str; machine_id: str; operation: str
 
 class ValidateReq(BaseModel):
-    license_key: str
-    machine_id:  str
+    license_key: str; machine_id: str
 
-@app.post("/validate")
-def validate(req: ValidateReq):
-    h = _hash(req.license_key)
-    with _db() as c:
-        row = _get_row(c, h)
-        valid, reason = _row_is_valid(row)
-        if not valid:
-            return {"valid": False, "reason": reason}
-        if row["machine_id"] != req.machine_id:
-            return {"valid": False, "reason": "wrong_machine"}
-    return {"valid": True, "reason": "ok", "expires_at": row["expires_at"]}
+class TransferReq(BaseModel):
+    session_id: str; machine_id: str
+    source_mesh: dict; source_weights: dict; target_mesh: dict
+    iterations: int = 0; expand: float = 0.0
 
+class SmoothReq(BaseModel):
+    session_id: str; machine_id: str
+    mesh: dict; weights: dict
+    iterations: int = 5; factor: float = 0.5; expand: float = 0.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ADMIN ENDPOINTS  (protected — used by dashboard)
-# ─────────────────────────────────────────────────────────────────────────────
+class CageReq(BaseModel):
+    session_id: str; machine_id: str
+    cage_mesh: dict; target_mesh: dict
+    offset: float = 0.002; subdiv_levels: int = 3
+
+class RigReq(BaseModel):
+    session_id: str; machine_id: str
+    bones: dict; autofix: bool = True
 
 class GenerateReq(BaseModel):
-    discord_user: Optional[str] = None
-    note:         Optional[str] = None
-    count:        int           = 1
+    discord_user: Optional[str] = None; note: Optional[str] = None; count: int = 1
 
-class AssignDiscordReq(BaseModel):
+class AssignReq(BaseModel):
     key_hash: str; discord_user: str
 
-class SetStatusReq(BaseModel):
+class StatusReq(BaseModel):
     key_hash: str; status: str
 
 class RenewReq(BaseModel):
     key_hash: str; days: int = 365
 
-class ResetMachineReq(BaseModel):
+class ResetReq(BaseModel):
     key_hash: str
 
+@app.post("/activate")
+def activate(req: ActivateReq):
+    _prune(); h = _hash(req.license_key)
+    with _db() as c:
+        row = _row(c, h)
+        if row is None:                    raise HTTPException(404, "License key not found.")
+        if row["status"] == "disabled":    raise HTTPException(403, "License deactivated. Contact support.")
+        if row["status"] == "expired":     raise HTTPException(403, "License expired. Contact support to renew.")
+        if row["status"] == "registered":
+            if row["machine_id"] != req.machine_id:
+                raise HTTPException(403, "This key is registered to another device. Contact support.")
+            valid, _ = _valid_row(row)
+            if not valid: raise HTTPException(403, "License not valid.")
+            sid = secrets.token_urlsafe(32)
+            _sessions[sid] = {"machine_id": req.machine_id, "key_hash": h, "expires": time.time() + SESSION_TTL}
+            return {"status": "already_active", "expires_at": row["expires_at"],
+                    "session_id": sid, "session_expires_in": SESSION_TTL}
+        now = datetime.datetime.utcnow()
+        exp = (now + datetime.timedelta(days=365)).isoformat()
+        c.execute("UPDATE licenses SET status='registered',machine_id=?,machine_name=?,"
+                  "activated_at=?,expires_at=? WHERE key_hash=?",
+                  (req.machine_id, req.machine_name or "", now.isoformat(), exp, h))
+        c.commit()
+    sid = secrets.token_urlsafe(32)
+    _sessions[sid] = {"machine_id": req.machine_id, "key_hash": h, "expires": time.time() + SESSION_TTL}
+    return {"status": "activated", "expires_at": exp, "session_id": sid, "session_expires_in": SESSION_TTL}
+
+@app.post("/session")
+def create_session(req: SessionReq):
+    _prune(); h = _hash(req.license_key)
+    with _db() as c:
+        row = _row(c, h); valid, reason = _valid_row(row)
+        if not valid:               return {"valid": False, "reason": reason}
+        if row["machine_id"] != req.machine_id: return {"valid": False, "reason": "wrong_machine"}
+        c.execute("UPDATE licenses SET machine_name=? WHERE key_hash=?",
+                  (req.machine_name or row["machine_name"], h))
+        c.commit()
+    sid = secrets.token_urlsafe(32)
+    _sessions[sid] = {"machine_id": req.machine_id, "key_hash": h, "expires": time.time() + SESSION_TTL}
+    return {"valid": True, "reason": "ok", "session_id": sid,
+            "session_expires_in": SESSION_TTL, "license_expires_at": row["expires_at"]}
+
+@app.post("/permit")
+def issue_permit(req: PermitReq):
+    _prune()
+    sess = _sessions.get(req.session_id)
+    if not sess or time.time() > sess["expires"]:
+        raise HTTPException(403, "Session not found or expired.")
+    if sess["machine_id"] != req.machine_id:
+        raise HTTPException(403, "Machine ID mismatch.")
+    with _db() as c:
+        row = _row(c, sess["key_hash"]); valid, reason = _valid_row(row)
+        if not valid:
+            del _sessions[req.session_id]; raise HTTPException(403, reason)
+        if row["machine_id"] != req.machine_id:
+            del _sessions[req.session_id]; raise HTTPException(403, "wrong_machine")
+    pid = secrets.token_urlsafe(24)
+    _permits[pid] = {"session_id": req.session_id, "operation": req.operation,
+                     "expires": time.time() + PERMIT_TTL, "used": False}
+    return {"allowed": True, "permit_id": pid}
+
+@app.post("/validate")
+def validate(req: ValidateReq):
+    h = _hash(req.license_key)
+    with _db() as c:
+        row = _row(c, h); valid, reason = _valid_row(row)
+        if not valid:                       return {"valid": False, "reason": reason}
+        if row["machine_id"] != req.machine_id: return {"valid": False, "reason": "wrong_machine"}
+    return {"valid": True, "reason": "ok", "expires_at": row["expires_at"]}
+
+@app.post("/api/transfer_weights")
+def api_transfer_weights(req: TransferReq):
+    _verify_session(req.session_id, req.machine_id)
+    try:
+        weights = algo_transfer_weights(
+            req.source_mesh["verts"], req.source_mesh["faces"],
+            req.source_weights, req.target_mesh["verts"])
+        return {"ok": True, "weights": weights}
+    except Exception as e:
+        return {"ok": False, "error": f"Computation error: {e}"}
+
+@app.post("/api/smooth_weights")
+def api_smooth_weights(req: SmoothReq):
+    _verify_session(req.session_id, req.machine_id)
+    try:
+        weights = algo_smooth_weights(
+            req.mesh["verts"], req.mesh["edges"],
+            req.weights, req.iterations, req.factor, req.expand)
+        return {"ok": True, "weights": weights}
+    except Exception as e:
+        return {"ok": False, "error": f"Computation error: {e}"}
+
+@app.post("/api/fit_cage")
+def api_fit_cage(req: CageReq):
+    _verify_session(req.session_id, req.machine_id)
+    try:
+        positions = algo_fit_cage(
+            req.cage_mesh["verts"], req.cage_mesh["faces"],
+            req.target_mesh["verts"], req.target_mesh["faces"],
+            req.offset, req.subdiv_levels)
+        return {"ok": True, "positions": positions}
+    except Exception as e:
+        return {"ok": False, "error": f"Computation error: {e}"}
+
+@app.post("/api/validate_rig")
+def api_validate_rig(req: RigReq):
+    _verify_session(req.session_id, req.machine_id)
+    try:
+        issues, renames = algo_validate_rig(req.bones, req.autofix)
+        return {"ok": True, "issues": issues, "renames": renames}
+    except Exception as e:
+        return {"ok": False, "error": f"Validation error: {e}"}
 
 @app.get("/admin/licenses", dependencies=[Depends(_require_admin)])
 def admin_list(status: Optional[str] = None):
     with _db() as c:
-        if status:
-            rows = c.execute("SELECT * FROM licenses WHERE status=? "
-                             "ORDER BY created_at DESC", (status,)).fetchall()
-        else:
-            rows = c.execute("SELECT * FROM licenses "
-                             "ORDER BY created_at DESC").fetchall()
+        q    = "SELECT * FROM licenses WHERE status=? ORDER BY created_at DESC" if status \
+               else "SELECT * FROM licenses ORDER BY created_at DESC"
+        rows = c.execute(q, (status,) if status else ()).fetchall()
     return {"count": len(rows), "licenses": [dict(r) for r in rows]}
-
 
 @app.get("/admin/stats", dependencies=[Depends(_require_admin)])
 def admin_stats():
     with _db() as c:
-        rows = c.execute("SELECT status, COUNT(*) n FROM licenses GROUP BY status").fetchall()
-    totals = {r["status"]: r["n"] for r in rows}
-    totals["total"] = sum(totals.values())
-    # Live session count
-    _prune()
-    totals["active_sessions"] = len(_sessions)
-    return totals
-
+        rows = c.execute("SELECT status,COUNT(*) n FROM licenses GROUP BY status").fetchall()
+    t = {r["status"]: r["n"] for r in rows}; t["total"] = sum(t.values())
+    _prune(); t["active_sessions"] = len(_sessions)
+    return t
 
 @app.post("/admin/generate", dependencies=[Depends(_require_admin)])
 def admin_generate(req: GenerateReq):
-    now  = _now_iso()
-    keys = []
+    now = _now(); keys = []
     with _db() as c:
         for _ in range(max(1, min(req.count, 100))):
-            raw = "RBLX-" + "-".join(
-                secrets.token_hex(2).upper() for _ in range(4)
-            )
-            h = _hash(raw)
+            raw = "RBLX-" + "-".join(secrets.token_hex(2).upper() for _ in range(4))
+            h   = _hash(raw)
             c.execute("INSERT OR IGNORE INTO licenses "
-                      "(key_hash,status,discord_user,note,created_at) "
-                      "VALUES (?, 'unused', ?, ?, ?)",
-                      (h, req.discord_user, req.note, now))
+                      "(key_hash,status,discord_user,note,created_at) VALUES(?,?,?,?,?)",
+                      (h, "unused", req.discord_user, req.note, now))
             keys.append(raw)
         c.commit()
     return {"generated": len(keys), "keys": keys}
 
-
 @app.post("/admin/assign_discord", dependencies=[Depends(_require_admin)])
-def admin_assign_discord(req: AssignDiscordReq):
+def admin_assign(req: AssignReq):
     with _db() as c:
         n = c.execute("UPDATE licenses SET discord_user=? WHERE key_hash=?",
                       (req.discord_user, req.key_hash)).rowcount
@@ -673,83 +717,59 @@ def admin_assign_discord(req: AssignDiscordReq):
     if n == 0: raise HTTPException(404, "Key not found.")
     return {"updated": True}
 
-
 @app.post("/admin/set_status", dependencies=[Depends(_require_admin)])
-def admin_set_status(req: SetStatusReq):
-    allowed = {"registered", "disabled", "unused"}
-    if req.status not in allowed:
-        raise HTTPException(422, f"status must be one of {allowed}")
-    # If disabling — also kill any active sessions for this key
+def admin_status(req: StatusReq):
+    if req.status not in {"registered", "disabled", "unused"}:
+        raise HTTPException(422, "Invalid status.")
+    dead = []
     if req.status == "disabled":
-        with _db() as c:
-            row = c.execute("SELECT key_hash FROM licenses WHERE key_hash=?",
-                            (req.key_hash,)).fetchone()
-        if row:
-            dead = [sid for sid, s in _sessions.items()
-                    if s["key_hash"] == req.key_hash]
-            for sid in dead: del _sessions[sid]
+        dead = [sid for sid, s in _sessions.items() if s.get("key_hash") == req.key_hash]
+        for sid in dead: del _sessions[sid]
     with _db() as c:
         n = c.execute("UPDATE licenses SET status=? WHERE key_hash=?",
                       (req.status, req.key_hash)).rowcount
         c.commit()
     if n == 0: raise HTTPException(404, "Key not found.")
-    return {"updated": True, "new_status": req.status,
-            "sessions_killed": len(dead) if req.status == "disabled" else 0}
-
+    return {"updated": True, "new_status": req.status, "sessions_killed": len(dead)}
 
 @app.post("/admin/renew", dependencies=[Depends(_require_admin)])
 def admin_renew(req: RenewReq):
-    new_exp = (datetime.datetime.utcnow()
-               + datetime.timedelta(days=req.days)).isoformat()
+    new_exp = (datetime.datetime.utcnow() + datetime.timedelta(days=req.days)).isoformat()
     with _db() as c:
-        row = c.execute("SELECT * FROM licenses WHERE key_hash=?",
-                        (req.key_hash,)).fetchone()
+        row = c.execute("SELECT * FROM licenses WHERE key_hash=?", (req.key_hash,)).fetchone()
         if not row: raise HTTPException(404, "Key not found.")
-        new_status = "registered" if row["machine_id"] else row["status"]
-        c.execute("UPDATE licenses SET expires_at=?, status=? WHERE key_hash=?",
-                  (new_exp, new_status, req.key_hash))
+        ns = "registered" if row["machine_id"] else row["status"]
+        c.execute("UPDATE licenses SET expires_at=?,status=? WHERE key_hash=?",
+                  (new_exp, ns, req.key_hash))
         c.commit()
     return {"renewed": True, "expires_at": new_exp}
 
-
 @app.post("/admin/reset_machine", dependencies=[Depends(_require_admin)])
-def admin_reset_machine(req: ResetMachineReq):
-    """Clear machine lock — key can be activated on a new device."""
-    with _db() as c:
-        row = c.execute("SELECT key_hash FROM licenses WHERE key_hash=?",
-                        (req.key_hash,)).fetchone()
-    if not row: raise HTTPException(404, "Key not found.")
-    # Kill sessions
-    dead = [sid for sid, s in _sessions.items()
-            if s["key_hash"] == req.key_hash]
+def admin_reset(req: ResetReq):
+    dead = [sid for sid, s in _sessions.items() if s.get("key_hash") == req.key_hash]
     for sid in dead: del _sessions[sid]
     with _db() as c:
-        c.execute("UPDATE licenses SET machine_id=NULL, machine_name=NULL, "
-                  "status='unused', activated_at=NULL WHERE key_hash=?",
-                  (req.key_hash,))
+        n = c.execute("UPDATE licenses SET machine_id=NULL,machine_name=NULL,"
+                      "status='unused',activated_at=NULL WHERE key_hash=?",
+                      (req.key_hash,)).rowcount
         c.commit()
+    if n == 0: raise HTTPException(404, "Key not found.")
     return {"reset": True, "sessions_killed": len(dead)}
-
 
 @app.delete("/admin/delete/{key_hash}", dependencies=[Depends(_require_admin)])
 def admin_delete(key_hash: str):
-    dead = [sid for sid, s in _sessions.items() if s["key_hash"] == key_hash]
+    dead = [sid for sid, s in _sessions.items() if s.get("key_hash") == key_hash]
     for sid in dead: del _sessions[sid]
     with _db() as c:
-        n = c.execute("DELETE FROM licenses WHERE key_hash=?",
-                      (key_hash,)).rowcount
+        n = c.execute("DELETE FROM licenses WHERE key_hash=?", (key_hash,)).rowcount
         c.commit()
     if n == 0: raise HTTPException(404, "Key not found.")
     return {"deleted": True}
 
-
 @app.get("/health")
 def health():
     _prune()
-    return {"status": "ok", "version": "2.5.0",
-            "active_sessions": len(_sessions),
-            "active_permits":  len(_permits)}
-
+    return {"status": "ok", "version": "3.0.0", "active_sessions": len(_sessions)}
 
 if __name__ == "__main__":
     import uvicorn
