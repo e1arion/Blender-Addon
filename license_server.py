@@ -262,7 +262,8 @@ SEEDED_KEY_HASHES = [
     "1d6a9bd73fc5b4c990dc291b5dc27342a12ad77c3c5d874bf15c282d562d1f8c",
 ]
 
-import os, sqlite3, hashlib, datetime, secrets, time
+import os, sqlite3, hashlib, datetime, secrets, time, json
+import urllib.request, urllib.error
 try:
     import numpy as np
     from scipy.spatial import KDTree
@@ -274,9 +275,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-me-before-deploying")
-DB_PATH     = os.environ.get("DB_PATH", "licenses.db")
-SESSION_TTL = 7200
+ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "change-me-before-deploying")
+DB_PATH      = os.environ.get("DB_PATH", "licenses.db")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+SESSION_TTL  = 7200
 PERMIT_TTL  = 60
 
 _sessions: Dict[str, dict] = {}
@@ -563,6 +565,10 @@ class RigReq(BaseModel):
 class GenerateReq(BaseModel):
     discord_user: Optional[str] = None; note: Optional[str] = None; count: int = 1
 
+class UpdateCheckReq(BaseModel):
+    owner: str
+    repo: str
+
 class AssignReq(BaseModel):
     key_hash: str; discord_user: str
 
@@ -775,6 +781,25 @@ def admin_delete(key_hash: str):
         c.commit()
     if n == 0: raise HTTPException(404, "Key not found.")
     return {"deleted": True}
+
+@app.post("/api/check_update")
+def api_check_update(req: UpdateCheckReq):
+    url     = f"https://api.github.com/repos/{req.owner}/{req.repo}/releases"
+    headers = {
+        "Accept":     "application/vnd.github+json",
+        "User-Agent": "RLC-Server",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=10) as r:
+            releases = json.loads(r.read().decode())
+        return {"ok": True, "releases": releases}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "releases": [], "error": str(e.code)}
+    except Exception as e:
+        return {"ok": False, "releases": [], "error": str(e)}
 
 @app.get("/health")
 def health():
