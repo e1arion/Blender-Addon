@@ -1,4 +1,3 @@
-# Pre-seeded key hashes — SHA-256 of each raw license key
 SEEDED_KEY_HASHES = [
     "d7aa4c04621867b12130b3939666d1d43f91e40b50d9d947d9ceabbe9e846590",
     "b9dea71b796bec235e5d7e559153dd6d22aa905b90065172cc5c92955b72769e",
@@ -278,8 +277,10 @@ from typing import Optional, Dict
 ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "change-me-before-deploying")
 DB_PATH      = os.environ.get("DB_PATH", "licenses.db")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
 SESSION_TTL  = 7200
-PERMIT_TTL  = 60
+PERMIT_TTL   = 60
 
 _sessions: Dict[str, dict] = {}
 _permits:  Dict[str, dict] = {}
@@ -565,10 +566,6 @@ class RigReq(BaseModel):
 class GenerateReq(BaseModel):
     discord_user: Optional[str] = None; note: Optional[str] = None; count: int = 1
 
-class UpdateCheckReq(BaseModel):
-    owner: str
-    repo: str
-
 class AssignReq(BaseModel):
     key_hash: str; discord_user: str
 
@@ -783,8 +780,10 @@ def admin_delete(key_hash: str):
     return {"deleted": True}
 
 @app.post("/api/check_update")
-def api_check_update(req: UpdateCheckReq):
-    url     = f"https://api.github.com/repos/{req.owner}/{req.repo}/releases"
+def api_check_update():
+    if not GITHUB_OWNER or not GITHUB_REPO:
+        return {"ok": False, "releases": [], "error": "Update source not configured on server."}
+    url     = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
     headers = {
         "Accept":     "application/vnd.github+json",
         "User-Agent": "RLC-Server",
