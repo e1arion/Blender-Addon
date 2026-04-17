@@ -779,6 +779,16 @@ def admin_delete(key_hash: str):
     if n == 0: raise HTTPException(404, "Key not found.")
     return {"deleted": True}
 
+@app.get("/api/config")
+def api_config():
+    return {
+        "ok":                 True,
+        "offline_grace_days": int(os.environ.get("OFFLINE_GRACE_DAYS", "1")),
+        "revalidate_secs":    int(os.environ.get("REVALIDATE_SECS",    "300")),
+        "update_check_secs":  int(os.environ.get("UPDATE_CHECK_SECS",  "300")),
+        "tri_warn_limit":     int(os.environ.get("TRI_WARN_LIMIT",     "4000")),
+    }
+
 @app.post("/api/check_update")
 def api_check_update():
     if not GITHUB_OWNER or not GITHUB_REPO:
